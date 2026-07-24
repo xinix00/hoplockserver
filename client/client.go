@@ -167,7 +167,14 @@ func (b *Backend) validate() error {
 }
 
 func (b *Backend) newRequest(ctx context.Context, method string, body []byte) (*http.Request, error) {
-	url := strings.TrimRight(b.URL, "/") + "/" + strings.TrimLeft(b.Key, "/")
+	return b.newObjectRequest(ctx, method, b.Key, body)
+}
+
+// newObjectRequest builds a request against an explicit object key,
+// independent of b.Key. The lease methods pass b.Key; the generic object
+// methods (object.go) pass the state key.
+func (b *Backend) newObjectRequest(ctx context.Context, method, key string, body []byte) (*http.Request, error) {
+	url := strings.TrimRight(b.URL, "/") + "/" + strings.TrimLeft(key, "/")
 	var reader io.Reader
 	if body != nil {
 		reader = bytes.NewReader(body)
@@ -193,8 +200,12 @@ func (b *Backend) client() *http.Client {
 }
 
 func (b *Backend) errFromResponse(op string, resp *http.Response) error {
+	return b.errForKey(op, b.Key, resp)
+}
+
+func (b *Backend) errForKey(op, key string, resp *http.Response) error {
 	const maxBody = 4 << 10
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
 	return fmt.Errorf("hoplockserver/client: %s %s: status %d %s: %s",
-		op, b.Key, resp.StatusCode, http.StatusText(resp.StatusCode), strings.TrimSpace(string(body)))
+		op, key, resp.StatusCode, http.StatusText(resp.StatusCode), strings.TrimSpace(string(body)))
 }
