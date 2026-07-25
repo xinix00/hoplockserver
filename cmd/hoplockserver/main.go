@@ -42,6 +42,9 @@ func main() {
 		Addr:              *listen,
 		Handler:           server.New(st, *apiKey),
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second, // bodies are tiny (lease/state, capped 1 MiB)
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
