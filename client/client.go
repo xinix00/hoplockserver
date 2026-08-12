@@ -4,24 +4,52 @@
 // This is the lightweight counterpart to hoplock/s3: same lease semantics,
 // no AWS account, no sigv4. Authentication is a single shared X-API-Key
 // header.
+//
+// The HTTP client is github.com/xinix00/lean (leanhttp, plus leanhttps for
+// an https URL) rather than net/http, on a host as well as on bare metal.
+// net/http links crypto/tls unconditionally, whether or not an https URL is
+// ever opened, and this package is linked into the HopOS kernel image that
+// boots on a 64MB node: there that cost about 2 MB.
 package client
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
+	"net"
+	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/xinix00/hoplock"
+	"github.com/xinix00/lean/leanhttp"
+	"github.com/xinix00/lean/leanhttps"
+	"github.com/xinix00/lean/leantls"
+	"github.com/xinix00/lean/leantls/x509verify"
+)
+
+// HTTP methods used here. leanhttp has no constants for them.
+const (
+	methodGet    = "GET"
+	methodPut    = "PUT"
+	methodDelete = "DELETE"
+)
+
+// Status codes leanhttp does not name itself.
+const (
+	statusConflict           = 409
+	statusPreconditionFailed = 412
 )
 
 // Backend talks to a hoplockserver over HTTP. The zero value is not
 // usable; populate URL and Key, then pass to hoplock.Elector or use the
 // Backend methods directly.
+//
+// A Backend owns a connection pool once it has been used, so use it by
+// pointer and do not copy it.
 type Backend struct {
 	// URL is the base URL of the hoplockserver (e.g. http://lock:8090).
 	// Required.
@@ -34,8 +62,15 @@ type Backend struct {
 	// authentication disabled.
 	APIKey string
 
-	// HTTPClient is used for all requests. Defaults to http.DefaultClient.
-	HTTPClient *http.Client
+	// Dial overrides how connections are made. nil — the normal case —
+	// derives the transport from the URL scheme: https gets a TLS dialer
+	// that validates the server's certificate chain, http dials plain TCP.
+	// Set this for a proxy or a unix socket; note that doing so replaces the
+	// TLS dialer, and with it the encryption.
+	Dial func(network, addr string) (net.Conn, error)
+
+	mu   sync.Mutex
+	pool *leanhttp.Client
 }
 
 var _ hoplock.Backend = (*Backend)(nil)
@@ -46,19 +81,15 @@ func (b *Backend) Read(ctx context.Context) (*hoplock.State, string, error) {
 	if err := b.validate(); err != nil {
 		return nil, "", err
 	}
-	req, err := b.newRequest(ctx, http.MethodGet, nil)
-	if err != nil {
-		return nil, "", err
-	}
-	resp, err := b.client().Do(req)
+	resp, err := b.do(ctx, methodGet, b.Key, nil, nil)
 	if err != nil {
 		return nil, "", fmt.Errorf("hoplockserver/client: GET %s: %w", b.Key, err)
 	}
 	defer resp.Body.Close()
 
 	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusNotFound:
+	case leanhttp.StatusOK:
+	case leanhttp.StatusNotFound:
 		return nil, "", hoplock.ErrNoLease
 	default:
 		return nil, "", b.errFromResponse("GET", resp)
@@ -90,27 +121,25 @@ func (b *Backend) Write(ctx context.Context, prevHandle string, state *hoplock.S
 	if err != nil {
 		return "", fmt.Errorf("hoplockserver/client: marshal state: %w", err)
 	}
-	req, err := b.newRequest(ctx, http.MethodPut, body)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
+	hdr := leanhttp.Header{"Content-Type": "application/json"}
 	if prevHandle == "" {
-		req.Header.Set("If-None-Match", "*")
+		hdr.Set("If-None-Match", "*")
 	} else {
-		req.Header.Set("If-Match", prevHandle)
+		hdr.Set("If-Match", prevHandle)
 	}
 
-	resp, err := b.client().Do(req)
+	resp, err := b.do(ctx, methodPut, b.Key, body, hdr)
 	if err != nil {
 		return "", fmt.Errorf("hoplockserver/client: PUT %s: %w", b.Key, err)
 	}
 	defer resp.Body.Close()
+	// Draining is what returns the connection to the pool: leanhttp only
+	// reuses one whose body was read to the end.
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated:
-	case http.StatusPreconditionFailed, http.StatusConflict:
+	case leanhttp.StatusOK, leanhttp.StatusCreated:
+	case statusPreconditionFailed, statusConflict:
 		return "", hoplock.ErrLeaseHeld
 	default:
 		return "", b.errFromResponse("PUT", resp)
@@ -131,25 +160,19 @@ func (b *Backend) Delete(ctx context.Context, handle string) error {
 	if handle == "" {
 		return hoplock.ErrLeaseHeld
 	}
-	req, err := b.newRequest(ctx, http.MethodDelete, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("If-Match", handle)
-
-	resp, err := b.client().Do(req)
+	resp, err := b.do(ctx, methodDelete, b.Key, nil, leanhttp.Header{"If-Match": handle})
 	if err != nil {
 		return fmt.Errorf("hoplockserver/client: DELETE %s: %w", b.Key, err)
 	}
 	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, resp.Body) // drain: see Write
 
 	switch resp.StatusCode {
-	case http.StatusOK, http.StatusNoContent:
+	case leanhttp.StatusOK, leanhttp.StatusNoContent:
 		return nil
-	case http.StatusNotFound:
+	case leanhttp.StatusNotFound:
 		return hoplock.ErrNoLease
-	case http.StatusPreconditionFailed:
+	case statusPreconditionFailed:
 		return hoplock.ErrLeaseHeld
 	default:
 		return b.errFromResponse("DELETE", resp)
@@ -166,46 +189,117 @@ func (b *Backend) validate() error {
 	return nil
 }
 
-func (b *Backend) newRequest(ctx context.Context, method string, body []byte) (*http.Request, error) {
-	return b.newObjectRequest(ctx, method, b.Key, body)
-}
-
-// newObjectRequest builds a request against an explicit object key,
-// independent of b.Key. The lease methods pass b.Key; the generic object
-// methods (object.go) pass the state key.
-func (b *Backend) newObjectRequest(ctx context.Context, method, key string, body []byte) (*http.Request, error) {
-	url := strings.TrimRight(b.URL, "/") + "/" + strings.TrimLeft(key, "/")
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
+// do sends one request for key over this Backend's connection pool. key is
+// explicit rather than always b.Key: the lease methods pass b.Key, the
+// generic object methods (object.go) pass the state key.
+//
+// Host, Content-Length, Connection and Accept-Encoding are deliberately not
+// in hdr: leanhttp writes those itself and rejects a caller who sets them.
+func (b *Backend) do(ctx context.Context, method, key string, body []byte, hdr leanhttp.Header) (*leanhttp.Response, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, method, url, reader)
-	if err != nil {
-		return nil, fmt.Errorf("hoplockserver/client: build %s: %w", method, err)
+	if hdr == nil {
+		hdr = leanhttp.Header{}
 	}
 	if b.APIKey != "" {
-		req.Header.Set("X-API-Key", b.APIKey)
+		hdr.Set("X-API-Key", b.APIKey)
 	}
-	if body != nil {
-		req.ContentLength = int64(len(body))
+	client, err := b.client()
+	if err != nil {
+		return nil, err
 	}
-	return req, nil
+	resp, err := client.Do(leanhttp.Call{
+		Method:  method,
+		URL:     strings.TrimRight(b.URL, "/") + "/" + strings.TrimLeft(key, "/"),
+		Header:  hdr,
+		Body:    body,
+		Timeout: timeoutFor(ctx),
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A 204 or 304 needs no handling here: leanhttp applies the bodyless rule
+	// itself since 12-08 (RFC 9112 §6.3). This package is one of the two that
+	// found that bug — a DELETE answers 204, and without the rule every delete
+	// stalled on a read that could never yield a byte.
+	return resp, nil
 }
 
-func (b *Backend) client() *http.Client {
-	if b.HTTPClient != nil {
-		return b.HTTPClient
+// client returns the Backend's connection pool, built on first use.
+//
+// One pool per Backend and not one per request: a lease is renewed every few
+// seconds, and without keep-alive every renew pays a TCP handshake plus, over
+// https, a key exchange.
+func (b *Backend) client() (*leanhttp.Client, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pool == nil {
+		dial, err := b.dialer()
+		if err != nil {
+			return nil, err
+		}
+		b.pool = &leanhttp.Client{Dial: dial}
 	}
-	return http.DefaultClient
+	return b.pool, nil
 }
 
-func (b *Backend) errFromResponse(op string, resp *http.Response) error {
+// dialer picks the transport from the URL scheme. A nil dialer is the answer
+// for http: leanhttp then dials plain TCP itself, and links no TLS.
+//
+// The roots are nil, meaning x509.SystemCertPool: on a host that is the OS
+// trust store, on a HopOS node it is the bundle the image baked in (import
+// golang.org/x/crypto/x509roots/fallback in the main). Verification is never
+// skipped — the lease server is the one peer where talking to an impostor is
+// worse than not talking at all.
+func (b *Backend) dialer() (func(network, addr string) (net.Conn, error), error) {
+	if b.Dial != nil {
+		return b.Dial, nil
+	}
+	u, err := url.Parse(b.URL)
+	if err != nil {
+		return nil, fmt.Errorf("hoplockserver/client: parse URL: %w", err)
+	}
+	switch u.Scheme {
+	case "https":
+		return leanhttps.Dialer(&leantls.Config{
+			VerifyPeer:          x509verify.Chain(nil),
+			SignatureAlgorithms: x509verify.SignatureAlgorithms,
+		}), nil
+	case "http":
+		return nil, nil
+	default:
+		return nil, fmt.Errorf("hoplockserver/client: URL scheme must be http or https, got %q", u.Scheme)
+	}
+}
+
+// timeoutFor turns a context deadline into leanhttp's per-call timeout.
+//
+// leanhttp has no context: a deadline it can express (one connection
+// deadline covering the body), a bare cancellation it cannot — that would
+// cost a goroutine per call to watch, and the connection pool makes closing
+// someone else's connection a real hazard. A context without a deadline
+// therefore gets no timeout, which is what http.DefaultClient did too.
+func timeoutFor(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	if d := time.Until(deadline); d > 0 {
+		return d
+	}
+	return time.Nanosecond // already past: fail on the first read, do not block
+}
+
+func (b *Backend) errFromResponse(op string, resp *leanhttp.Response) error {
 	return b.errForKey(op, b.Key, resp)
 }
 
-func (b *Backend) errForKey(op, key string, resp *http.Response) error {
+func (b *Backend) errForKey(op, key string, resp *leanhttp.Response) error {
 	const maxBody = 4 << 10
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody))
-	return fmt.Errorf("hoplockserver/client: %s %s: status %d %s: %s",
-		op, key, resp.StatusCode, http.StatusText(resp.StatusCode), strings.TrimSpace(string(body)))
+	// resp.Status is "403 Forbidden": the code plus the reason phrase the
+	// server itself sent, so no status-text table is needed here.
+	return fmt.Errorf("hoplockserver/client: %s %s: status %s: %s",
+		op, key, resp.Status, strings.TrimSpace(string(body)))
 }
