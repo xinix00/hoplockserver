@@ -67,7 +67,7 @@ type Backend struct {
 	// that validates the server's certificate chain, http dials plain TCP.
 	// Set this for a proxy or a unix socket; note that doing so replaces the
 	// TLS dialer, and with it the encryption.
-	Dial func(network, addr string) (net.Conn, error)
+	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	mu   sync.Mutex
 	pool *leanhttp.Client
@@ -239,7 +239,7 @@ func (b *Backend) client() (*leanhttp.Client, error) {
 		if err != nil {
 			return nil, err
 		}
-		b.pool = &leanhttp.Client{Dial: dial}
+		b.pool = &leanhttp.Client{DialContext: dial}
 	}
 	return b.pool, nil
 }
@@ -252,7 +252,7 @@ func (b *Backend) client() (*leanhttp.Client, error) {
 // golang.org/x/crypto/x509roots/fallback in the main). Verification is never
 // skipped — the lease server is the one peer where talking to an impostor is
 // worse than not talking at all.
-func (b *Backend) dialer() (func(network, addr string) (net.Conn, error), error) {
+func (b *Backend) dialer() (func(ctx context.Context, network, addr string) (net.Conn, error), error) {
 	if b.Dial != nil {
 		return b.Dial, nil
 	}
@@ -262,7 +262,7 @@ func (b *Backend) dialer() (func(network, addr string) (net.Conn, error), error)
 	}
 	switch u.Scheme {
 	case "https":
-		return leanhttps.Dialer(&leantls.Config{
+		return leanhttps.DialerContext(&leantls.Config{
 			VerifyPeer:          x509verify.Chain(nil),
 			SignatureAlgorithms: x509verify.SignatureAlgorithms,
 		}), nil
