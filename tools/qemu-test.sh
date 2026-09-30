@@ -149,6 +149,10 @@ RED="HOPOS_PANIC|HOPOS_EXCEPTION|HOPOS_APP_PANIC|HOPOS_HOP_FAULT|HOPOS_HOP_EXIT|
 # require START_SLOT mount support"), want START_SLOT (abi::systemapi
 # StartReq) draagt nog geen mounts. Zonder volume staat /data in de eigen
 # root van het slot, en die is bij elke start leeg (kern/src/rpc.rs).
+# Standaard een volume: sinds HopOS alpha.11 en Hop 88f1d3a gaan de volumes
+# van een jobspec mee in START_SLOT, dus de sleutel overleeft een herstart
+# van de job. VOLUME= (leeg) toetst de kale vorm zonder volume.
+VOLUME="${VOLUME-/volumes/hoplock}"
 VOLUMES=""
 [ -n "${VOLUME:-}" ] && VOLUMES=',"volumes":{"'"$VOLUME"'":"/data"}'
 JOB='{"name":"hoplock","driver":"hop","artifacts":[{"url":"http://10.0.2.2:'"$ARTPORT"'/hoplockserver-hopos.elf"}],"memory_limit":33554432,"ports":{"http":8090},"env":{"HOPLOCK_API_KEY":"'"$KEY"'"}'"$VOLUMES"'}'
