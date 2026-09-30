@@ -36,8 +36,8 @@
 #   EXT_TARGET=pad                       waar kern en Hop gebouwd worden
 #                                        (standaard target/ext in deze repo:
 #                                        in de andere repo's verandert niets)
-#   VOLUME=/volumes/hoplock              geeft de job een volume op /data (Hop
-#                                        alpha.10 weigert dat nog op HopOS)
+#   VOLUME=/volumes/hoplock              het volume van de job op /data
+#                                        (standaard; VOLUME= toetst zonder)
 #   SYSPORT/AGENTPORT/LEADERPORT/ARTPORT/LOCKPORT   de host-poorten;
 #                                        standaard (en bezet) een vrije van het OS
 set -eu
@@ -144,11 +144,9 @@ STOP_MARKS="slot 2: ports withdrawn from the uplink HOPOS_SLOT_UNPUBLISH"
 UP="slot [0-9]+: .*HOPOS_HOPLOCK_UP keys="
 RED="HOPOS_PANIC|HOPOS_EXCEPTION|HOPOS_APP_PANIC|HOPOS_HOP_FAULT|HOPOS_HOP_EXIT|HOPOS_HOP_FAIL|HOPOS_SLOT_PUBLISH_FAIL|HOPOS_HOPLOCK_FAIL"
 
-# Het volume van de job gaat alleen mee met VOLUME=<gedeeld pad>: Hop
-# v3.0.0-alpha.10 weigert een job met volumes op HopOS ("persistent volumes
-# require START_SLOT mount support"), want START_SLOT (abi::systemapi
-# StartReq) draagt nog geen mounts. Zonder volume staat /data in de eigen
-# root van het slot, en die is bij elke start leeg (kern/src/rpc.rs).
+# Zonder volume staat /data in de eigen root van het slot, en die is bij
+# elke start leeg (kern/src/rpc.rs): dan is de herstart-stap per definitie
+# rood. Met een volume draagt START_SLOT de mount (HopOS alpha.11).
 # Standaard een volume: sinds HopOS alpha.11 en Hop 88f1d3a gaan de volumes
 # van een jobspec mee in START_SLOT, dus de sleutel overleeft een herstart
 # van de job. VOLUME= (leeg) toetst de kale vorm zonder volume.
