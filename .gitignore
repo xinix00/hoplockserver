@@ -1,4 +1,4 @@
 /data/
-/bin/
-/hoplockserver
+/target/
 *.log
+.DS_Store
