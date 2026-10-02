@@ -179,9 +179,9 @@ instead. This server is the small, free option.
 | `src/bin/hoplockserver-hopos.rs` | Feature `hopos`: the HopOS resident (applib, leanhttp over `applib::tcp`) |
 | `OLD/` | The Go server: the specification |
 
-Dependencies come from git tags only: lean v3.1.1 (`leanhttp`), hop
-v3.0.0-alpha.10 (`auth` for SHA-256, `hostnet` for the host sockets; `store`
-and `discovery` for the client tests), HopOS v3.0.0-alpha.10 (`applib`,
+Dependencies come from git tags only: lean v3.1.3 (`leanhttp`), hop
+v3.0.0 (`auth` for SHA-256, `hostnet` for the host sockets; `store`
+and `discovery` for the client tests), HopOS v3.0.0 (`applib`,
 `sync`).
 
 ## Tests
